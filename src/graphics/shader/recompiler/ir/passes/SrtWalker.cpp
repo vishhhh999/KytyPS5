@@ -60,7 +60,8 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
-	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) {
+	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
+	    op != ValueOpcode::LoadBufferU32) {
 		return false;
 	}
 	const auto index = inst.Flags<MemoryFlags>().index;
@@ -68,8 +69,20 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 		return false;
 	}
 	const auto kind = values.memory_info[index].kind;
+	// NOTE (personal-fork experiment, not upstream-safe): a Buffer-kind load is
+	// normally per-lane/divergent, which is exactly why upstream keeps this
+	// gate scoped to ScalarAddress/ScalarBuffer only (see KytyPS5/KytyPS5#507).
+	// We accept it here on the assumption that if this value made it into a
+	// descriptor-selection graph at all, it was already forced wave-uniform
+	// upstream of this point (typically via ReadFirstLane) in the shaders that
+	// hit this path -- the evaluator below still recursively requires every
+	// operand (index/offset/soffset) to itself be host-resolvable, so a
+	// genuinely divergent load with no such expression will still fail to
+	// evaluate rather than silently produce a wrong per-lane value. It does
+	// NOT prove uniformity the way a real fix would; it just doesn't crash.
 	return (op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
-	       (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer);
+	       (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer) ||
+	       (op == ValueOpcode::LoadBufferU32 && kind == ResourceKind::Buffer);
 }
 
 bool IsDescriptorHandle(ValueOpcode opcode) {
@@ -134,7 +147,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::FPOrdGreaterThanEqual32:
 		case ValueOpcode::FPIsNan32:
 		case ValueOpcode::FPMul32:
-		case ValueOpcode::FPTrunc32: return true;
+		case ValueOpcode::FPTrunc32:
+		case ValueOpcode::FPRecipIFlag32: return true;
 		default: return false;
 	}
 }
@@ -582,16 +596,23 @@ private:
 		if (handle == nullptr) {
 			return false;
 		}
-		uint64_t low    = 0;
-		uint64_t high   = 0;
-		uint64_t offset = 0;
-		if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+		uint64_t low  = 0;
+		uint64_t high = 0;
+		if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high)) {
 			return false;
 		}
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 		uint64_t   address   = 0;
-		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
+		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
+		    inst.GetOpcode() == ValueOpcode::LoadBufferU32) {
+			// Both opcodes address through the same 4-dword V# shape (base
+			// lo/hi, records, word3-with-stride) -- LoadBufferU32 additionally
+			// carries a per-lane index (idxen) and vgpr offset (offen), which
+			// ReadBufferAddress() already zeroes out when the instruction
+			// didn't encode that addressing mode, so the formula below
+			// degrades to the ReadConstBuffer case automatically when those
+			// are absent.
 			uint64_t records = 0;
 			uint64_t word3   = 0;
 			if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
@@ -600,10 +621,26 @@ private:
 			if (immediate < 0) {
 				return false;
 			}
-			const auto byte_offset =
-			    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
+			const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+			uint64_t   offset = 0;
+			uint64_t   scaled = 0;
+			if (inst.GetOpcode() == ValueOpcode::LoadBufferU32) {
+				// LoadBufferU32 args: {resource, index, offset, soffset, exec}.
+				// We deliberately don't inspect `exec` here -- see the
+				// wave-uniformity caveat on IsRawRead() above.
+				uint64_t index   = 0;
+				uint64_t soffset = 0;
+				if (!Arg(inst, 1, index) || !Arg(inst, 2, offset) || !Arg(inst, 3, soffset)) {
+					return false;
+				}
+				scaled = static_cast<uint32_t>(index) * static_cast<uint64_t>(stride);
+				offset += soffset;
+			} else if (!Arg(inst, 1, offset)) {
+				return false;
+			}
+			const auto byte_offset = static_cast<uint64_t>(immediate) +
+			                        static_cast<uint32_t>(offset) + scaled;
 			const auto aligned = byte_offset & ~uint64_t {3};
-			const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 			const auto size = stride == 0u
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
@@ -612,6 +649,10 @@ private:
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
+			uint64_t offset = 0;
+			if (!Arg(inst, 1, offset)) {
+				return false;
+			}
 			const auto relative = (immediate & ~int64_t {3}) +
 			                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 			if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
@@ -683,6 +724,7 @@ private:
 			}
 			case ValueOpcode::LoadAddressU32:
 			case ValueOpcode::ReadConstBuffer:
+			case ValueOpcode::LoadBufferU32:
 				if (IsRawRead(m_program, inst)) {
 					return EvaluateRawRead(inst, result);
 				}
@@ -755,6 +797,23 @@ private:
 			case ValueOpcode::FPTrunc32:
 				if (Arg(inst, 0, a)) {
 					result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FPRecipIFlag32:
+				// Matches EmitFPRecipIFlag32's codegen (plain 1.0f/x, no denormal
+				// flush -- IFLAG inputs come from an int-to-float convert and
+				// can't be denormal). A host double-rounded reciprocal can be
+				// off by up to 1 ULP from the GPU's approximate instruction;
+				// shaders using V_RCP_IFLAG_F32 for unsigned division already
+				// carry their own integer fixup after it specifically to
+				// correct for that, so this is safe to host-evaluate exactly.
+				if (Arg(inst, 0, a)) {
+					const auto value = Float32(a);
+					if (value == 0.0f) {
+						return false;
+					}
+					result = std::bit_cast<uint32_t>(1.0f / value);
 					return true;
 				}
 				return false;
